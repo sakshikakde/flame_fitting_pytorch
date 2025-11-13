@@ -1,0 +1,10 @@
+*/__pycache__/*
+*.npy
+*.npz
+*.pkl
+*.pt
+*.pth
+*.png
+*.jpg
+*.ply
+*.obj
