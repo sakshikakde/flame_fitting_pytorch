@@ -24,9 +24,9 @@ class MeshFitting:
         # shape regularizer (weight higher to regularize face shape more towards the mean)
         weights['shape'] = 1e-3
         # expression regularizer (weight higher to regularize facial expression more towards the mean)
-        weights['expr']  = 1e-3
+        weights['expr']  = 1e-4
         # regularization of head rotation around the neck and jaw opening (weight higher for more regularization)
-        weights['pose']  = 1e-2
+        weights['pose']  = 1e-4
         # number of shape and expression parameters (we do not recommend using too many parameters for fitting to sparse keypoints)
         self.weights = weights
 
@@ -40,18 +40,57 @@ class MeshFitting:
         self.save_dir = save_dir
         os.makedirs(self.save_dir, exist_ok=True)
 
-        self.optim_scale = torch.optim.Adam(
-            [self.scale],
-            lr=1e-1,
-        )
-
         self.optim_rigid = torch.optim.Adam(
             [self.transl, self.scale],
             lr=1e-1,
         )
 
-    def landmark_loss(self, pred_lmk, target_lmk):
+        self.optim_non_rigid = torch.optim.Adam(
+            [self.shape, self.exp, self.pose],
+            lr=1e-1,
+        )
+
+
+    def landmark_loss_3D(self, pred_lmk, target_lmk):
         return torch.mean(torch.sum((pred_lmk - target_lmk)**2, dim=2))
+    
+
+    def landmark_loss_2D(self, pred_lmk, target_lmk):
+        # Use only x (index 0) and z (index 2)
+        pred_xz = pred_lmk[:, :, [0, 2]]
+        target_xz = target_lmk[:, :, [0, 2]]
+        return torch.mean(torch.sum((pred_xz - target_xz) ** 2, dim=2))
+    
+
+    def optimize_non_rigid(self, target_lmk, num_iters=1000):
+        for iter in range(num_iters):
+            self.optim_non_rigid.zero_grad()
+
+            vertices, pred_lmk = self.flame_model(
+                shape_params=self.shape,
+                expression_params=self.exp,
+                pose_params=self.pose,
+                transl=self.transl
+            )
+            pred_lmk = pred_lmk * self.scale
+
+            # Landmark loss (main term)
+            lmk_loss = self.landmark_loss_2D(pred_lmk, target_lmk) * self.weights.get('lmk', 1.0)
+
+            # Regularization terms
+            shape_reg = torch.mean(self.shape ** 2) * self.weights.get('shape', 1e-3)
+            exp_reg   = torch.mean(self.exp ** 2)   * self.weights.get('expr', 1e-3)
+            pose_reg  = torch.mean(self.pose[:, 3:] ** 2) * self.weights.get('pose', 1e-2)
+            # (exclude global rotation — first 3 pose params)
+
+            # Total loss
+            total_loss = lmk_loss + shape_reg + exp_reg + pose_reg
+
+            total_loss.backward()
+            self.optim_non_rigid.step()
+
+            if iter % 10 == 0:
+                print(f"Iter {iter}/{num_iters} - Total Loss: {total_loss.item():.4e} - Lmk Loss: {lmk_loss.item():.4e}")
 
     def optimize_rigid(self, target_lmk, num_iters=1000):
         for iter in range(num_iters):
@@ -65,14 +104,14 @@ class MeshFitting:
             )
             pred_lmk = pred_lmk * self.scale
 
-            lmk_loss = self.landmark_loss(pred_lmk, target_lmk) * self.weights['lmk']
+            lmk_loss = self.landmark_loss_3D(pred_lmk, target_lmk) * self.weights['lmk']
             total_loss = lmk_loss
 
             total_loss.backward()
 
             self.optim_rigid.step()
             if iter % 10 == 0:
-                print(f"Iter {iter}/{num_iters} - Total Loss: {total_loss.item():.4f} - Lmk Loss: {lmk_loss.item():.4f}")
+                print(f"Iter {iter}/{num_iters} - Total Loss: {total_loss.item():.4e} - Lmk Loss: {lmk_loss.item():.4e}")
 
 
 
@@ -102,6 +141,7 @@ class MeshFitting:
         plot_landmarks(image, lmk3d, save_file=os.path.join(self.save_dir, "mediapipe_landmarks.png"))
         lmk3d = align_with_flame_axes(lmk3d)
         
+        save_landmarks_as_ply(lmk3d, os.path.join(self.save_dir, "mediapipe_landmarks_all.ply"))
 
         static_lmk3d_idx = self.flame_model.lmk_idx.detach().numpy()
         static_lmk3d = lmk3d[static_lmk3d_idx, :]
@@ -109,6 +149,8 @@ class MeshFitting:
         save_landmarks_as_ply(static_lmk3d, os.path.join(self.save_dir, "mediapipe_landmarks.ply"))
 
         self.optimize_rigid(torch.tensor(static_lmk3d).unsqueeze(0).float().to(self.device), num_iters=500)
+        self.optimize_non_rigid(torch.tensor(static_lmk3d).unsqueeze(0).float().to(self.device), num_iters=500)
+
         self.save_final_mesh(
             mesh_save_path=os.path.join(self.save_dir, "fitted_mesh.obj"),
             lmk_save_path=os.path.join(self.save_dir, "fitted_landmarks.ply"),
